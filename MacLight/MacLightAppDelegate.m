@@ -17,28 +17,16 @@
 -(void)awakeFromNib{
     statusItem = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength] retain];
     [statusItem setMenu:statusMenu];
-    [statusItem setTitle:@"MacLight"];
+    [statusItem setTitle:@"BackLight"];
     [statusItem setHighlightMode:YES];
     
-    [startupMenuItem setState:[self isLaunchAtStartup]];
+    [captureMenuItem setState:[self isLaunchAtStartup]];
     
 	// we don't have a serial port open yet
 	serialFileDescriptor = -1;
 	
 	[self loadSerialPortList];
-    
-    for (NSString *serialPort in serialPortList) {
-        NSLog(@"Found a port: %@", serialPort);
-        if ([serialPort rangeOfString:@"usbserial"].location != NSNotFound || [serialPort rangeOfString:@"usbmodem"].location != NSNotFound) {
-            selectedSerialPort = serialPort;
-            NSLog(@"Found an arduino: %@", serialPort);
-        }
-    }
-    [self openSerialPort: selectedSerialPort baud:9600];
-    
-//	[self startCapturing:nil];
 }
-
 
 CVReturn DisplayLinkCallback (
                                 CVDisplayLinkRef displayLink,
@@ -55,21 +43,25 @@ CVReturn DisplayLinkCallback (
 }
 
 - (void)dealloc {
-    CVDisplayLinkStop(displayLink);
+//    CVDisplayLinkStop(displayLink);
     [super dealloc];
 }
 
 
 -(IBAction)closeApp:(id)sender{
+    [self stopCapturing];
+    [self writeBlack];
     // Add a delay to ensure that it terminates at the top of the next pass through the event loop
     [NSApp performSelector:@selector(terminate:) withObject:nil afterDelay:0.0];
 }
 
 
+// get all the paths "/dev/tty..." to available serial devices and store them in member
 - (void) loadSerialPortList {
 	io_object_t serialPort;
 	io_iterator_t serialPortIterator;
 	
+    /// @todo make the list a local var
 	serialPortList = [[NSMutableArray alloc] init];
 	
 	// ask for all the serial ports
@@ -82,15 +74,56 @@ CVReturn DisplayLinkCallback (
         
 		IOObjectRelease(serialPort);
 	}
-		
 	IOObjectRelease(serialPortIterator);
+    
+    
+    /* fill the 'serial ports' menu. */
+    NSMenu *serialPortsMenu = [[NSMenu alloc] initWithTitle:@"available Ports"];
+    
+    for (NSString *serialPort in serialPortList) {
+        NSLog(@"Found a port: %@", serialPort);
+        NSString* name = serialPort;
+        /* Create new menu item for the port. */
+        NSMenuItem *serialPortItem = [[NSMenuItem alloc] initWithTitle:name action:@selector(serialPortSelected:) keyEquivalent:@""];
+        [serialPortItem setTarget:self];
+        [serialPortsMenu addItem:serialPortItem];
+        [serialPortItem release];
+    }
+    [statusMenu setSubmenu:serialPortsMenu forItem:serialMenuItem];
+    [serialPortsMenu release];
+}
+
+- (IBAction)foo:(id)sender
+{
+    NSLog(@"foo");
+}
+
+/*
+ A serial port item was selected from the menu.
+ */
+- (IBAction)serialPortSelected:(id)sender
+{
+    NSMenuItem *menuItem = (NSMenuItem *)sender;
+    NSString* serialPort = [menuItem title];
+    
+    // open the serial port
+    NSString *error = [self openSerialPort: serialPort baud:115200];
+    
+    if(error!=nil) {
+        NSLog(error);
+    }
 }
 
 
 - (void)sampleScreen {
-    NSAssert(mOpenGLScreenReader, @"No screen reader");
-	NSColor *averageCol = [mOpenGLScreenReader readFullScreenToBuffer];
-    [self writeColor:averageCol];
+    NSAssert(screenReader, @"No screen reader");
+    
+    if (!lock) {
+        lock = TRUE;
+        uint8_t *buffer = [screenReader readScreenBuffer];
+        [self writeBuffer:buffer];
+        lock = FALSE;
+    }
 }
 
 
@@ -99,42 +132,23 @@ CVReturn DisplayLinkCallback (
     [captureMenuItem setState:NSOnState];
     [manualMenuItem setState:NSOffState];
     
-    mOpenGLScreenReader = [[[OpenGLScreenReader alloc] init] retain];
-	NSAssert( mOpenGLScreenReader != 0, @"OpenGLScreenReader alloc failed");
+    screenReader = [[[OpenGLScreenReader alloc] init] retain];
+	NSAssert( screenReader != 0, @"OpenGLScreenReader alloc failed");
     
-    CVReturn            error = kCVReturnSuccess;
-    CGDirectDisplayID   displayID = CGMainDisplayID();
-    
-    error = CVDisplayLinkCreateWithCGDisplay(displayID, &displayLink);
-    if(error)
-    {
-        NSLog(@"DisplayLink created with error:%d", error);
-        displayLink = NULL;
-    }
-    error = CVDisplayLinkSetOutputCallback(displayLink, DisplayLinkCallback, self);
-    if(error)
-    {
-        NSLog(@"DisplayLink callback creation failed with error:%d", error);
-        displayLink = NULL;
-    }
-    
-    if (displayLink){
-        CVDisplayLinkStart(displayLink);
-    }
+    sampleTimer = [NSTimer timerWithTimeInterval:1.0/15 target:self selector:@selector(sampleScreen) userInfo:nil repeats:YES];
+    [[NSRunLoop currentRunLoop] addTimer:sampleTimer forMode:(NSString *)kCFRunLoopCommonModes];
 }
 
 - (void)stopCapturing {
-    CVDisplayLinkStop(displayLink);
-    
     if (sampleTimer) {
         [captureMenuItem setState:NSOffState];
         [manualMenuItem setState:NSOnState];
         [sampleTimer invalidate];
         [sampleTimer release];
         sampleTimer = nil;
-        if (mOpenGLScreenReader){
-            [mOpenGLScreenReader release];
-            mOpenGLScreenReader = nil;
+        if (screenReader){
+            [screenReader release];
+            screenReader = nil;
         }
     }
 }
@@ -234,19 +248,59 @@ CVReturn DisplayLinkCallback (
 	return errorMessage;
 }
 
-- (void) writeColor: (NSColor *) color {
-    [self writeByte:0x55];    
-    [self writeByte:0xAA];
+- (void) writeBlack {
+    // write compatible to EasyTransfer lib
     
-    int val;
-    val = [color redComponent]*255*0.9;
-    [self writeByte:val];
+    if (serialFileDescriptor == -1) {
+        NSLog(@"No serial port selected");
+        return;
+    }
     
-    val = [color greenComponent]*255;
-    [self writeByte:val];
+    uint8_t checksum = NUM_LED * 3;
+    uint8_t magic_1 = 0x06;
+    uint8_t magic_2 = 0x85;
     
-    val = [color blueComponent]*255;
-    [self writeByte:val];
+    // these magic bytes define the start
+    // of a message for EasyTransfer.
+    // The starter is followed by the length of the payload...
+    write(serialFileDescriptor, &magic_1, 1);
+    write(serialFileDescriptor, &magic_2, 1);
+    write(serialFileDescriptor, &checksum, 1);
+    
+    for (int i = 0; i < NUM_LED * 3; i++) {
+        uint8_t toSend = 0;
+        write(serialFileDescriptor, &toSend, 1); // ...the payload itself...
+        checksum ^= 0;
+    }
+    write(serialFileDescriptor, &checksum, 1);    // ...and a checksum (the length and each payload byte xor'ed)
+}
+
+- (void) writeBuffer: (uint8_t *) buffer {
+    // write compatible to EasyTransfer lib
+    // see: LINK
+    
+    if (serialFileDescriptor == -1) {
+        NSLog(@"No serial port selected");
+        return;
+    }
+    
+    uint8_t checksum = NUM_LED * 3;
+    uint8_t magic_1 = 0x06; 
+    uint8_t magic_2 = 0x85;
+    
+    // these magic bytes define the start
+    // of a message for EasyTransfer.
+    // The starter is followed by the length of the payload...
+    write(serialFileDescriptor, &magic_1, 1);
+    write(serialFileDescriptor, &magic_2, 1);
+    write(serialFileDescriptor, &checksum, 1);
+    
+    for (int i = 0; i < NUM_LED * 3; i++) {
+        uint8_t toSend = buffer[i];
+        write(serialFileDescriptor, &toSend, 1); // ...the payload itself...
+        checksum ^= buffer[i];
+    }
+    write(serialFileDescriptor, &checksum, 1);    // ...and a checksum (the length and each payload byte xor'ed)
 }
 
 - (void) writeByte: (int)val {
@@ -269,15 +323,33 @@ CVReturn DisplayLinkCallback (
     [self writeColor:picker.color];
 }
 
-// action sent when serial port selected
-- (IBAction) serialPortSelected: (id) cntrl {
-	// open the serial port
-	NSString *error = [self openSerialPort: selectedSerialPort baud:9600];
-	
-	if(error!=nil) {
-		NSLog(error);
-	} else {
-	}
+- (void) writeColor:(NSColor *)color {
+    if (serialFileDescriptor == -1) {
+        NSLog(@"No serial port selected");
+        return;
+    }
+    
+    uint8_t checksum = NUM_LED * 3;
+    uint8_t magic_1 = 0x06;
+    uint8_t magic_2 = 0x85;
+    
+    uint8_t r = 255 * color.redComponent;
+    uint8_t g = 255 * color.greenComponent;
+    uint8_t b = 255 * color.blueComponent;
+    
+    write(serialFileDescriptor, &magic_1, 1);
+    write(serialFileDescriptor, &magic_2, 1);
+    write(serialFileDescriptor, &checksum, 1);
+    
+    for (int i = 0; i < NUM_LED; i++) {
+        write(serialFileDescriptor, &r, 1);
+        checksum ^= r;
+        write(serialFileDescriptor, &g, 1);
+        checksum ^= g;
+        write(serialFileDescriptor, &b, 1);
+        checksum ^= b;
+    }
+    write(serialFileDescriptor, &checksum, 1);    // ...and a checksum (the length and each payload byte xor'ed)
 }
 
 - (BOOL)isLaunchAtStartup {

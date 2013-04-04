@@ -51,15 +51,20 @@
 #import <Cocoa/Cocoa.h>
 #import <Quartz/Quartz.h>
 
+#define NUM_LED 49
 
 @interface OpenGLScreenReader : NSObject {
-	NSOpenGLContext *mGLContext;
     void *mData;
     long mByteWidth, mWidth, mHeight;
+    uint_fast8_t gamma[256][3];
+    uint_fast8_t previous_frame[NUM_LED][3];
+    uint_fast8_t current_frame[NUM_LED][3];
+    uint_fast32_t pixel_offset[NUM_LED][256];
+    uint_fast16_t led_color[NUM_LED][3];
+//    const uint_fast8_t led_coords[25][3];
 }
 
-- (NSColor *) readPartialScreenToBuffer: (size_t) width bufferHeight:(size_t) height bufferBaseAddress: (void *) baseAddress;
-- (NSColor *) readFullScreenToBuffer;
+- (uint_fast8_t *) readScreenBuffer;
 
 
 @end

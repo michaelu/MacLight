@@ -15,144 +15,169 @@
 
 @implementation OpenGLScreenReader
 
+// ---------- Constants ----------
+
+const uint_fast8_t fade = 33;
+const uint_fast8_t min_brightness = 128;
+
+const uint_fast8_t displays[][3] = {
+    {0,21,15}   // 21 leds wide, 15 leds high
+//    {1,21,15} // hypothetical second display
+};
+
+// setup led array
+const uint_fast8_t leds[NUM_LED][3] = {
+    {0,0,14}, {0,0,13}, {0,0,12}, {0,0,11}, {0,0,10}, {0,0,9}, {0,0,8},
+    {0,0,7}, {0,0,6}, {0,0,5}, {0,0,4}, {0,0,3}, {0,0,2}, {0,0,1},                   // Left edge
+    
+    {0,0,0}, {0,1,0}, {0,2,0}, {0,3,0}, {0,4,0}, {0,5,0}, {0,6,0},                   // Top edge
+    {0,7,0}, {0,8,0}, {0,9,0}, {0,10,0}, {0,11,0}, {0,12,0}, {0,13,0},               // More top edge
+    {0,14,0}, {0,15,0}, {0,16,0}, {0,17,0}, {0,18,0}, {0,19,0}, {0,20,0},            // even more top edge
+    
+    {0,20,1}, {0,20,2}, {0,20,3}, {0,20,4}, {0,20,5}, {0,20,6}, {0,20,7},         // Right edge
+    {0,20,8}, {0,20,9}, {0,20,10}, {0,20,11}, {0,20,12}, {0,20,13}, {0,20,14},
+};
+
 #pragma mark ---------- Initialization ----------
 
 -(id) init
 {
     if ((self = [super init]))
     {
-		// Create a full-screen OpenGL graphics context
-		
-		// Specify attributes of the GL graphics context
-		NSOpenGLPixelFormatAttribute attributes[] = {
-			NSOpenGLPFAFullScreen,
-			NSOpenGLPFAScreenMask,
-			CGDisplayIDToOpenGLDisplayMask(kCGDirectMainDisplay),
-			(NSOpenGLPixelFormatAttribute) 0
-			};
+        // get image
+        CGImageRef image = CGDisplayCreateImage(kCGDirectMainDisplay);
+        
+        size_t width  = CGImageGetWidth(image);
+        size_t height = CGImageGetHeight(image);
+        
+        size_t bpr = CGImageGetBytesPerRow(image);
+        size_t bpp = CGImageGetBitsPerPixel(image);
+        size_t bpc = CGImageGetBitsPerComponent(image);
+        size_t bytes_per_pixel = bpp / bpc;
 
-		NSOpenGLPixelFormat *glPixelFormat = [[NSOpenGLPixelFormat alloc] initWithAttributes:attributes];
-		if (!glPixelFormat)
-		{
-			return nil;
-		}
-
-		// Create OpenGL context used to render
-		mGLContext = [[[NSOpenGLContext alloc] initWithFormat:glPixelFormat shareContext:nil] autorelease];
-
-		// Cleanup, pixel format object no longer needed
-		[glPixelFormat release];
-    
-        if (!mGLContext)
-        {
-            [self release];
-            return nil;
+        // fill previous frame
+        for (int i = 0; i < NUM_LED; i++) {
+            previous_frame[i][0] = previous_frame[i][1] = previous_frame[i][2] = min_brightness / 3;
         }
-        [mGLContext retain];
+        
+        // precompute gamma
+        float f;
+        for(int i = 0; i < 256; i++) {
+            f           = pow((float)i / 255.0, 2.8);
+            gamma[i][0] = f * 255.0;
+            gamma[i][1] = f * 240.0;
+            gamma[i][2] = f * 220.0;
+        }
+        
+        // Precompute locations of every pixel to read when downsampling.
+        // Saves a bunch of math on each frame, at the expense of a chunk
+        // of RAM.  Number of samples is now fixed at 256; this allows for
+        // some crazy optimizations in the downsampling code.
+        for(int i = 0; i < NUM_LED; i++) { // For each LED...
+            int d = leds[i][0]; // Corresponding display index
+            
+            // Precompute columns, rows of each sampled point for this LED
+            int x[16];
+            int y[16];
+            float range = (float)width / (float)displays[d][1];
+            float step  = range / 16.0;
+            float start = range * (float)leds[i][1] + step * 0.5;
+            for(int col = 0; col < 16; col++)
+                x[col] = (int)(start + step * (float)col);
+            
+            range = (float)height / (float)displays[d][2];
+            step  = range / 16.0;
+            start = range * (float)leds[i][2] + step * 0.5;
+            for(int row = 0; row < 16; row++)
+                y[row] = (int)(start + step * (float)row);
 
-        // Set our context as the current OpenGL context
-        [mGLContext makeCurrentContext];
-        // Set full-screen mode
-        [mGLContext setFullScreen];
-
-		NSRect mainScreenRect = [[NSScreen mainScreen] frame];
-		mWidth = mainScreenRect.size.width;
-		mHeight = mainScreenRect.size.height;
-
-        mByteWidth = mWidth * 4;                // Assume 4 bytes/pixel for now
-        mByteWidth = (mByteWidth + 3) & ~3;    // Align to 4 bytes
-
-        mData = malloc(mByteWidth * mHeight);
-        NSAssert( mData != 0, @"malloc failed");
+            // Get offset to each pixel within full screen capture
+            for(int row = 0; row < 16; row++) {
+                for(int col = 0; col < 16; col++) {
+                    pixel_offset[i][row * 16 + col] = y[row] * bpr + x[col] * bytes_per_pixel;
+                }
+            }
+        }
+        CFRelease(image);
     }
     return self;
 }
 
 #pragma mark ---------- Screen Reader  ----------
 
-// Perform a simple, synchronous full-screen read operation using glReadPixels(). 
-// Although this is not the most optimal technique, it is sufficient for doing 
-// simple one-shot screen grabs.
-- (NSColor *)readFullScreenToBuffer
+
+- (uint_fast8_t *)readScreenBuffer
 {
-    return [self readPartialScreenToBuffer: mWidth bufferHeight: mHeight bufferBaseAddress: mData];
-}
+    CGImageRef image = CGDisplayCreateImage(kCGDirectMainDisplay);
+    
+    CGDataProviderRef provider = CGImageGetDataProvider(image);
+    NSData* data = (id)CGDataProviderCopyData(provider);
+    [data autorelease];
+    const uint8_t* bytes = [data bytes];
+    
+    int weight = 257 - fade; // 'Weighting factor' for new frame vs. old
+    int j;
+    
+    // This computes a single pixel value filtered down from a rectangular
+    // section of the screen.  While it would seem tempting to use the native
+    // image scaling in Processing/Java, in practice this didn't look very
+    // good -- either too pixelated or too blurry, no happy medium.  So
+    // instead, a "manual" downsampling is done here.  In the interest of
+    // speed, it doesn't actually sample every pixel within a block, just
+    // a selection of 256 pixels spaced within the block...the results still
+    // look reasonably smooth and are handled quickly enough for video.
+    
+    // For each LED...
+    for(int i = 0; i < NUM_LED; i++) {  
+        uint_fast16_t r, g, b, sum, s2, deficit;
+        r = g = b = 0;
+        
+        // ...pick 256 samples
+        for(int sample = 0; sample < 256; sample++) {
+            const uint8_t* pixel = &bytes[pixel_offset[i][sample]];
+            r += pixel[2];
+            g += pixel[1];
+            b += pixel[0];
+        }
 
-// Use this routine if you want to read only a portion of the screen pixels
-- (NSColor *)readPartialScreenToBuffer: (size_t) width bufferHeight:(size_t) height bufferBaseAddress: (void *)baseAddress
-{
-    // Set our context as the current OpenGL context
-    [mGLContext makeCurrentContext];
-    
-    // select front buffer as our source for pixel data
-    glReadBuffer(GL_FRONT);
-    
-    //Read OpenGL context pixels directly.
+        // Blend new average with the value from the prior frame
+        led_color[i][0] = ((((r >> 8) & 0xff) * weight + previous_frame[i][0] * fade) >> 8);
+        led_color[i][1] = ((((g >> 8) & 0xff) * weight + previous_frame[i][1] * fade) >> 8);
+        led_color[i][2] = ((((b >> 8) & 0xff) * weight + previous_frame[i][2] * fade) >> 8);
+        
+        // Boost pixels that fall below the minimum brightness
+        sum = led_color[i][0] + led_color[i][1] + led_color[i][2];
+        if(sum < min_brightness) {
+            if(sum == 0) { // To avoid divide-by-zero
+                deficit = min_brightness / 3; // Spread equally to R,G,B
+                led_color[i][0] += deficit;
+                led_color[i][1] += deficit;
+                led_color[i][2] += deficit;
+            } else {
+                deficit = min_brightness - sum;
+                s2      = sum * 2;
+                // Spread the "brightness deficit" back into R,G,B in proportion to
+                // their individual contribition to that deficit.  Rather than simply
+                // boosting all pixels at the low end, this allows deep (but saturated)
+                // colors to stay saturated...they don't "pink out."
+                led_color[i][0] += deficit * (sum - led_color[i][0]) / s2;
+                led_color[i][1] += deficit * (sum - led_color[i][1]) / s2;
+                led_color[i][2] += deficit * (sum - led_color[i][2]) / s2;
+            }
+        }
+        
+        // Apply gamma curve and place in serial output buffer
+        j = 0;
+        current_frame[i][j] = gamma[led_color[i][0]][0];
+        j++;
+        current_frame[i][j] = gamma[led_color[i][1]][1];
+        j++;
+        current_frame[i][j] = gamma[led_color[i][2]][2];
 
-    // For extra safety, save & restore OpenGL states that are changed
-    glPushClientAttrib(GL_CLIENT_PIXEL_STORE_BIT);
+    }
+    CFRelease(image);
     
-    glPixelStorei(GL_PACK_ALIGNMENT, 4); /* Force 4-byte alignment */
-    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
-    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
-    
-	
-    //Read a block of pixels from the frame buffer
-    glReadPixels(0, 0, width, height, GL_BGRA, 
-            GL_UNSIGNED_INT_8_8_8_8_REV,
-            baseAddress);
-	int pixelIndex;
-	unsigned char blue, green, red;
-	unsigned char *restrict tempBuffer = baseAddress;
-	
-	NSInteger sumRed = 0;	
-	NSInteger sumGreen = 0;	
-	NSInteger sumBlue = 0;
-	NSInteger sampleCount = 0;
-	
-	NSInteger skipFactor = 10;
-	NSAssert( skipFactor > 0, @"accuraccy below 1");
-	
-	
-	int topMargin = 200;
-	int bottomMargin = 200;
-	int leftMargin = 200;
-	int rightMargin = 200;
-	
-	NSInteger yPixels = height - topMargin - bottomMargin;
-	NSInteger xPixels = width - leftMargin - rightMargin;
-	
-	for( int j=topMargin; j<yPixels; j+=skipFactor ) {
-		for( int i=leftMargin; i<xPixels; i++ ) {
-			pixelIndex = (j*width + i)*4;
-			blue = tempBuffer[pixelIndex];
-			green = tempBuffer[pixelIndex+1];
-			red = tempBuffer[pixelIndex+2];
-			
-			sumRed += red;
-			sumGreen += green;
-			sumBlue += blue;
-			sampleCount++;
-		}
-	}
-	//NSLog(@"%i samples", sampleCount);
-	
-	//NSAssert( sampleCount == height*width, @"sampleCount failed");
-	NSAssert( sampleCount != 0, @"sampleCount shouldn't be 0");
-	
-	int32_t avRed = (sumRed / sampleCount) & 0x000000ff;
-	int32_t avGreen = (sumGreen / sampleCount) & 0x000000ff;
-	int32_t avBlue = (sumBlue / sampleCount) & 0x000000ff;
-			
-    glPopClientAttrib();
-
-    //Check for OpenGL errors
-    GLenum theError = GL_NO_ERROR;
-    theError = glGetError();
-    NSAssert( theError == GL_NO_ERROR, @"OpenGL error 0x%04X", theError);
-    
-    return [NSColor colorWithDeviceRed: avRed/255.0 green: avGreen/255.0 blue: avBlue/255.0 alpha: 1.0];
+    return current_frame;
 }
 
 
@@ -160,14 +185,14 @@
 
 -(void)dealloc
 {    
-    // Get rid of GL context
-    [NSOpenGLContext clearCurrentContext];
-    // disassociate from full screen
-    [mGLContext clearDrawable];
-    // and release the context
-    [mGLContext release];
-	// release memory for screen data
-	free(mData);
+//    // Get rid of GL context
+//    [NSOpenGLContext clearCurrentContext];
+//    // disassociate from full screen
+//    [mGLContext clearDrawable];
+//    // and release the context
+//    [mGLContext release];
+//	// release memory for screen data
+//	free(mData);
 
     [super dealloc];
 }
