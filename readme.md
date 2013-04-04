@@ -21,7 +21,8 @@ There seems to be a problem if the computer goes to sleep mode while the serial 
 * The number of leds is hard coded - make it configurable
 * Fun feature: show a preview of the pixel data that is transfered to the controller.
 * Apply gamma to constant color value.
-
+* Clean up code
+* Rename OpenGLScreenReader - it doesn't use openGL
 * Allow user to calibrate the output level of each channel. The red LEDs in my setup are slightly too bright, so all red values are multiplied by 0.9 at the moment.
 * Refactor things out of app delegate where possible
 * Retain user settings
